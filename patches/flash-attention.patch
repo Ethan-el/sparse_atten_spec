@@ -1,0 +1,471 @@
+diff --git a/hopper/flash.h b/hopper/flash.h
+index 2f7caab..55c0748 100644
+--- a/hopper/flash.h
++++ b/hopper/flash.h
+@@ -1,3 +1,4 @@
++// Modified for sparse_atten_spec: Vegas scores and sparse slots; see NOTICE.
+ /******************************************************************************
+  * Copyright (c) 2023, Tri Dao.
+  ******************************************************************************/
+@@ -170,6 +171,13 @@ struct Flash_fwd_params : public Qkv_params {
+     // The S extra matrix, (num_heads)
+     void *__restrict__ s_aux_ptr;
+ 
++    // Vegas: optional first/last QK output and physical per-token KV slots.
++    void* scores_ptr;
++    int64_t scores_batch_stride, scores_head_stride, scores_query_stride;
++    int scores_max_len;
++    int const* sparse_token_slots;
++    int64_t sparse_token_slots_batch_stride;
++
+     // CP (Context Parallelism) parameters
+     int cp_world_size;
+     int cp_rank;
+diff --git a/hopper/flash_api.cpp b/hopper/flash_api.cpp
+index b7f2f69..31cc32d 100644
+--- a/hopper/flash_api.cpp
++++ b/hopper/flash_api.cpp
+@@ -1,3 +1,4 @@
++// Modified for sparse_atten_spec: Vegas scores and sparse slots; see NOTICE.
+ /******************************************************************************
+  * Copyright (c) 2024, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
+  ******************************************************************************/
+@@ -771,7 +772,9 @@ mha_fwd(Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens
+         const std::optional<Tensor> &s_aux_, // (h)
+         int const cp_world_size,  // context parallelism (cp) world size
+         int const cp_rank,         // cp rank
+-        const std::optional<Tensor> &cp_tot_seqused_k_ // b. total seqused_k in cp world
++        const std::optional<Tensor> &cp_tot_seqused_k_, // b. total seqused_k in cp world
++        const std::optional<Tensor> &scores_,
++        const std::optional<Tensor> &sparse_token_slots_
+         ) {
+ 
+     auto dprops = get_device_prop();
+@@ -779,6 +782,24 @@ mha_fwd(Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens
+     STD_TORCH_CHECK(is_sm8x, "FlashAttention only supports Ampere GPUs or newer.");
+ 
+     auto q_type = q.scalar_type();
++    bool const vegas = scores_.has_value() || sparse_token_slots_.has_value();
++    if (vegas) {
++        STD_TORCH_CHECK(dprops->major == 9 && q_type == ScalarType::BFloat16,
++                        "Vegas requires SM90 BF16 FA3");
++        STD_TORCH_CHECK(!(scores_.has_value() && sparse_token_slots_.has_value()),
++                        "Vegas scores and sparse token slots are mutually exclusive");
++        STD_TORCH_CHECK(cu_seqlens_q_.has_value() && seqused_k_.has_value() && page_table_.has_value(),
++                        "Vegas requires varlen queries and paged KV with used lengths");
++        STD_TORCH_CHECK(cp_world_size == 1 && !cp_tot_seqused_k_.has_value() &&
++                        !kv_batch_idx_.has_value() && !leftpad_k_.has_value() &&
++                        !k_new_.has_value() && !v_new_.has_value() && !q_v_.has_value() &&
++                        !s_aux_.has_value() && !rotary_cos_.has_value() && !rotary_sin_.has_value(),
++                        "Vegas does not support CP, remapping, append, rotary, Qv or sinks");
++        STD_TORCH_CHECK(softcap == 0.f && window_size_left < 0 && window_size_right <= 0 && is_causal,
++                        "Vegas requires causal global attention without softcap");
++        STD_TORCH_CHECK(num_splits <= 1 && !scheduler_metadata_.has_value(),
++                        "Vegas requires unsplit attention and fresh scheduling");
++    }
+     STD_TORCH_CHECK(q_type == ScalarType::Half || q_type == ScalarType::BFloat16 || q_type == ScalarType::Float8_e4m3fn,
+                 "FlashAttention only supports fp16, bf16, and fp8_e4m3 data type");
+     if (dprops->major < 9) {
+@@ -829,6 +850,30 @@ mha_fwd(Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens
+     int num_heads = q.size(-2);
+     int const head_size = q.size(-1);
+     int const head_size_v = v.size(-1);
++    if (vegas) {
++        STD_TORCH_CHECK(head_size == head_size_v, "Vegas requires equal QK/V head dimensions");
++        if (scores_.has_value()) {
++            auto const& scores = scores_.value();
++            CHECK_DEVICE(scores); CHECK_CONTIGUOUS(scores);
++            STD_TORCH_CHECK(scores.get_device_index() == q.get_device_index(), "scores must be on query device");
++            STD_TORCH_CHECK(scores.scalar_type() == ScalarType::BFloat16 && scores.dim() == 4 &&
++                            scores.size(0) == batch_size && scores.size(1) == num_heads &&
++                            scores.size(2) == 2 && scores.size(3) % 8 == 0,
++                            "scores must be contiguous BF16 [batch, heads, 2, aligned_max_k]");
++            STD_TORCH_CHECK(max_seqlen_k_.has_value() && scores.size(3) >= max_seqlen_k_.value(),
++                            "scores buffer is smaller than max key length");
++        }
++        if (sparse_token_slots_.has_value()) {
++            auto const& slots = sparse_token_slots_.value();
++            CHECK_DEVICE(slots);
++            STD_TORCH_CHECK(slots.get_device_index() == q.get_device_index(), "slots must be on query device");
++            STD_TORCH_CHECK(slots.scalar_type() == ScalarType::Int && slots.dim() == 2 &&
++                            slots.size(0) == batch_size && slots.stride(1) == 1 && seqlen_q == 1,
++                            "sparse_token_slots must be int32 [batch, capacity] for single-query drafting");
++            STD_TORCH_CHECK(max_seqlen_k_.has_value() && slots.size(1) >= max_seqlen_k_.value(),
++                            "slot table is smaller than max key length");
++        }
++    }
+     int const max_num_pages_per_seq = !paged_KV ? 0 : page_table.size(1);
+     int const num_pages = !paged_KV ? 0 : k.size(0);
+     int const page_size = !paged_KV ? 1 : k.size(1);
+@@ -992,6 +1037,19 @@ mha_fwd(Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens
+     params.b_k = batch_size_k;
+     params.dv = head_size_v;
+     params.dv_rounded = head_size_v_rounded;
++    if (scores_.has_value()) {
++        auto const& scores = scores_.value();
++        params.scores_ptr = scores.data_ptr();
++        params.scores_batch_stride = scores.stride(0);
++        params.scores_head_stride = scores.stride(1);
++        params.scores_query_stride = scores.stride(2);
++        params.scores_max_len = scores.size(3);
++    }
++    if (sparse_token_slots_.has_value()) {
++        auto const& slots = sparse_token_slots_.value();
++        params.sparse_token_slots = static_cast<int const*>(slots.data_ptr());
++        params.sparse_token_slots_batch_stride = slots.stride(0);
++    }
+     if (leftpad_k_.has_value()) {  // This needs to be set before get_pagedkv_tma
+         params.leftpad_k = static_cast<int *>(leftpad_k_.value().data_ptr());
+     }
+@@ -1055,8 +1113,8 @@ mha_fwd(Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens
+     // Temporarily set num_splits_dynamic_ptr to 1 since get_num_splits checks it
+     params.num_splits_dynamic_ptr = !use_prepare_varlen ? nullptr : reinterpret_cast<int*>(1);
+ 
+-    params.pagedkv_tma = get_pagedkv_tma(params);
+-    params.num_splits = num_splits <= 0 ? get_num_splits(params) : num_splits;
++    params.pagedkv_tma = !sparse_token_slots_.has_value() && get_pagedkv_tma(params);
++    params.num_splits = vegas ? 1 : (num_splits <= 0 ? get_num_splits(params) : num_splits);
+     // printf("Num splits = %d.\n", params.num_splits);
+     params.pack_gqa = pack_gqa_.has_value() ? pack_gqa_.value() : get_pack_gqa(params);
+     // Always enable PackGQA for Split
+@@ -1768,4 +1826,3 @@ mha_combine(const Tensor &out_partial,         // num_splits x batch_size x seql
+ 
+     return {out, softmax_lse};
+ }
+-
+diff --git a/hopper/flash_api_torch_lib.cpp b/hopper/flash_api_torch_lib.cpp
+index b0e4833..25e68b7 100644
+--- a/hopper/flash_api_torch_lib.cpp
++++ b/hopper/flash_api_torch_lib.cpp
+@@ -1,3 +1,4 @@
++// Modified for sparse_atten_spec: Vegas optional arguments; see NOTICE.
+ #include "registration.h"
+ 
+ #include <torch/csrc/stable/tensor.h>
+@@ -64,7 +65,9 @@ mha_fwd(Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens
+         const std::optional<Tensor> &s_aux_,
+         int const cp_world_size,
+         int const cp_rank,
+-        const std::optional<Tensor> &cp_tot_seqused_k
++        const std::optional<Tensor> &cp_tot_seqused_k,
++        const std::optional<Tensor> &scores,
++        const std::optional<Tensor> &sparse_token_slots
+ );
+ 
+ // Only applicable to the case where seqused_k (i.e. cache_seqlens) is available
+@@ -157,7 +160,9 @@ std::vector<Tensor> mha_fwd_stable(
+     std::optional<Tensor> s_aux,
+     int64_t cp_world_size,
+     int64_t cp_rank,
+-    std::optional<Tensor> cp_tot_seqused_k) {
++    std::optional<Tensor> cp_tot_seqused_k,
++    std::optional<Tensor> scores,
++    std::optional<Tensor> sparse_token_slots) {
+   return mha_fwd(
+       q, k, v,
+       k_new,
+@@ -193,7 +198,9 @@ std::vector<Tensor> mha_fwd_stable(
+       s_aux,
+       narrow_int64_to_int(cp_world_size, "cp_world_size"),
+       narrow_int64_to_int(cp_rank, "cp_rank"),
+-      cp_tot_seqused_k);
++      cp_tot_seqused_k,
++      scores,
++      sparse_token_slots);
+ }
+ 
+ Tensor mha_fwd_get_scheduler_metadata_stable(
+@@ -288,7 +295,9 @@ STABLE_TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+             "    Tensor?  s_aux,"
+             "    int      cp_world_size,"
+             "    int      cp_rank,"
+-            "    Tensor?  cp_tot_seqused_k) -> Tensor[]");
++            "    Tensor?  cp_tot_seqused_k,"
++            "    Tensor!? scores=None,"
++            "    Tensor?  sparse_token_slots=None) -> Tensor[]");
+ 
+     ops.def("get_scheduler_metadata("
+             "    int      batch_size,"
+diff --git a/hopper/flash_fwd_launch_template.h b/hopper/flash_fwd_launch_template.h
+index 105545b..dbbc6f4 100644
+--- a/hopper/flash_fwd_launch_template.h
++++ b/hopper/flash_fwd_launch_template.h
+@@ -1,3 +1,4 @@
++// Modified for sparse_atten_spec: Vegas scores and sparse slots; see NOTICE.
+ /******************************************************************************
+  * Copyright (c) 2024, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
+  ******************************************************************************/
+@@ -27,7 +28,7 @@ using namespace cute;
+ 
+ template <int Arch, int kHeadDim, int kHeadDimV, int ClusterM, typename Element, typename ElementOut,
+           bool Is_causal, bool Is_local, bool Has_softcap, bool Varlen, bool PagedKVNonTMA, bool AppendKV, bool HasQv, bool OnlyQv,
+-          bool PackGQA, bool Split, bool V_colmajor, bool Use_one_mma_wg, int kBlockH=1>
++          bool PackGQA, bool Split, bool V_colmajor, bool Use_one_mma_wg, int kBlockH=1, bool ReturnScores=false>
+ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+     static_assert(!OnlyQv || HasQv, "OnlyQv requires HasQv");
+     static_assert(!(Is_causal && Is_local), "Causal and Local cannot be enabled at the same time");
+@@ -54,7 +55,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+     using ClusterShape = cute::Shape<Int<ClusterM>, _1, _1>;
+     using CollectiveMainloop = std::conditional_t<
+         Arch >= 90,
+-        flash::CollectiveMainloopFwdSm90<kStages, ClusterShape, TileShape_MNK, kHeadDimV, Element, float, cutlass::arch::Sm90, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV, HasQv, OnlyQv, MmaPV_is_RS, IntraWGOverlap, PackGQA, Split, V_colmajor, ElementS, kBlockH>,
++        flash::CollectiveMainloopFwdSm90<kStages, ClusterShape, TileShape_MNK, kHeadDimV, Element, float, cutlass::arch::Sm90, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV, HasQv, OnlyQv, MmaPV_is_RS, IntraWGOverlap, PackGQA, Split, V_colmajor, ElementS, kBlockH, ReturnScores>,
+         flash::CollectiveMainloopFwdSm80<kNWarps, kStages, Q_in_regs, TileShape_MNK, kHeadDimV, Element, float, cutlass::arch::Sm80, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV, PackGQA, Split, ElementS>
+     >;
+     using CollectiveEpilogue = flash::CollectiveEpilogueFwd<TileShape_MNK_PV, ClusterShape, ElementOut, ArchTag, CollectiveMainloop::NumMmaThreads, Varlen, PackGQA, Split, FP8_TransposeV, kBlockH>;
+@@ -136,6 +137,15 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+         static_cast<ElementS const*>(params.s_aux_ptr),
+         params.cp_world_size, params.cp_rank, params.cp_tot_seqused_k
+     };
++    if constexpr (Arch >= 90) {
++        mainloop_args.scores_ptr = static_cast<cutlass::bfloat16_t*>(params.scores_ptr);
++        mainloop_args.scores_batch_stride = params.scores_batch_stride;
++        mainloop_args.scores_head_stride = params.scores_head_stride;
++        mainloop_args.scores_query_stride = params.scores_query_stride;
++        mainloop_args.scores_max_len = params.scores_max_len;
++        mainloop_args.sparse_token_slots = params.sparse_token_slots;
++        mainloop_args.sparse_token_slots_batch_stride = params.sparse_token_slots_batch_stride;
++    }
+     typename CollectiveEpilogue::Arguments epilogue_args {
+         static_cast<ElementOut*>(params.o_ptr),
+         {seqlen_q, params.dv, params.h, batch_q, params.num_splits},  // shape_O
+@@ -234,7 +244,10 @@ void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream) {
+                                         // Non-unary values of kBlockH can improve GQA perf for specific ratios (4, 8, 16) by enabling TMA for loading Q
+                                         // Disable for hdim diff, fp16, 1 mma wg or split to shrink build
+                                         static constexpr int kBlockH = !PackGQA || Arch < 90 || (kHeadDim != kHeadDimV) || cute::is_same_v<T, cutlass::half_t> || Use_one_mma_wg || Split ? 1 : kBlockH_;
+-                                        run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, OnlyQv, PackGQA, Split, V_colmajor, Use_one_mma_wg, kBlockH>(params, stream);
++                                        BOOL_SWITCH(params.scores_ptr != nullptr, ReturnScores_, [&] {
++                                            static constexpr bool ReturnScores = ReturnScores_ && Arch >= 90 && cute::is_same_v<T, cutlass::bfloat16_t> && !Split && !Has_softcap && !HasQv;
++                                            run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, OnlyQv, PackGQA, Split, V_colmajor, Use_one_mma_wg, kBlockH, ReturnScores>(params, stream);
++                                        });
+                                     });
+                                 });
+                             });
+diff --git a/hopper/mainloop_fwd_sm90_tma_gmma_ws.hpp b/hopper/mainloop_fwd_sm90_tma_gmma_ws.hpp
+index 2ed58ae..8eba09a 100644
+--- a/hopper/mainloop_fwd_sm90_tma_gmma_ws.hpp
++++ b/hopper/mainloop_fwd_sm90_tma_gmma_ws.hpp
+@@ -1,3 +1,4 @@
++// Modified for sparse_atten_spec: Vegas scores and sparse slots; see NOTICE.
+ /******************************************************************************
+  * Copyright (c) 2024, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
+  ******************************************************************************/
+@@ -31,7 +32,7 @@ using namespace cute;
+ template <int Stages, class ClusterShape_, class TileShape_MNK_, int kHeadDimV, class Element_, class ElementAccum_, class ArchTag_,
+         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKVNonTMA_, bool AppendKV_, bool HasQv_,
+         bool OnlyQv_,
+-        bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_, class ElementSAux_, int kBlockH_=1>
++        bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_, class ElementSAux_, int kBlockH_=1, bool ReturnScores_=false>
+ struct CollectiveMainloopFwdSm90 {
+ 
+     static constexpr int kStages = Stages;
+@@ -55,6 +56,9 @@ struct CollectiveMainloopFwdSm90 {
+     static constexpr bool PackGQA = PackGQA_;
+     static constexpr bool PackGQA_TMA = PackGQA && kBlockH_ > 1;
+     static constexpr bool Split = Split_;
++    static constexpr bool ReturnScores = ReturnScores_;
++    static_assert(!ReturnScores || (cute::is_same_v<Element, cutlass::bfloat16_t> && !Split && !Has_softcap && !HasQv),
++                  "Vegas scores require unsplit BF16 QK without softcap or Qv");
+     static constexpr bool V_colmajor = V_colmajor_;
+     static constexpr bool Transpose_V = Is_FP8 && !V_colmajor;
+     static constexpr bool Use_TMA_Q = !PackGQA || PackGQA_TMA;
+@@ -423,6 +427,11 @@ struct CollectiveMainloopFwdSm90 {
+         int const cp_world_size = 1;
+         int const cp_rank = 0;
+         int const* const cp_tot_seqused_k = nullptr;
++        cutlass::bfloat16_t* scores_ptr = nullptr;
++        int64_t scores_batch_stride = 0, scores_head_stride = 0, scores_query_stride = 0;
++        int scores_max_len = 0;
++        int const* sparse_token_slots = nullptr;
++        int64_t sparse_token_slots_batch_stride = 0;
+     };
+ 
+     // Device side kernel params
+@@ -483,6 +492,11 @@ struct CollectiveMainloopFwdSm90 {
+         int cp_world_size = 1;
+         int cp_rank = 0;
+         int const* const cp_tot_seqused_k = nullptr;
++        cutlass::bfloat16_t* scores_ptr = nullptr;
++        int64_t scores_batch_stride = 0, scores_head_stride = 0, scores_query_stride = 0;
++        int scores_max_len = 0;
++        int const* sparse_token_slots = nullptr;
++        int64_t sparse_token_slots_batch_stride = 0;
+     };
+ 
+     static Params
+@@ -621,7 +635,9 @@ struct CollectiveMainloopFwdSm90 {
+                 args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
+                 args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary,
+                 args.ptr_S_aux,
+-                args.cp_world_size, args.cp_rank, args.cp_tot_seqused_k};
++                args.cp_world_size, args.cp_rank, args.cp_tot_seqused_k,
++                args.scores_ptr, args.scores_batch_stride, args.scores_head_stride, args.scores_query_stride,
++                args.scores_max_len, args.sparse_token_slots, args.sparse_token_slots_batch_stride};
+     }
+ 
+     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
+@@ -783,7 +799,8 @@ struct CollectiveMainloopFwdSm90 {
+             params.ptr_K, params.shape_K, params.stride_K,
+             params.ptr_V, params.headdim_v, params.stride_V,
+             params.page_size_divmod, params.blockN_per_page_size_divmod,
+-            bidb_kv, bidh_kv, thread_idx, seqlen_info.seqlen_k - n_offset, seqlen_info.leftpad_k + n_offset, bidb_kv_idx
++            bidb_kv, bidh_kv, thread_idx, seqlen_info.seqlen_k - n_offset, seqlen_info.leftpad_k + n_offset, bidb_kv_idx,
++            params.sparse_token_slots, params.sparse_token_slots_batch_stride
+         );
+ 
+         // Set up for transposing V, only used if Transpose_V
+@@ -1172,6 +1189,63 @@ struct CollectiveMainloopFwdSm90 {
+             if constexpr (Has_softcap) { flash::apply_softcap(tSrS, softcap_val); }
+         };
+ 
++        // Ported from npz7yyk/vllm-flash-attn@0c05c4b: save raw QK for the first/last query.
++        Tensor scores_coords = [&] {
++            Tensor cS = cute::make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
++            Tensor tScS = tiled_mma_qk.get_thread_slice(thread_idx).partition_C(cS);
++            return make_tensor(tScS.data(), flash::convert_layout_acc_rowcol(tScS.layout()));
++        }();
++        constexpr int kScoresRows = decltype(size<0>(scores_coords))::value;
++        constexpr int kScoresCols = decltype(size<1>(scores_coords))::value;
++        cutlass::bfloat16_t* scores_rows[kScoresRows] = {};
++        int scores_cols[kScoresCols];
++        int scores_valid_k = 0;
++        bool scores_any_row = false;
++        if constexpr (ReturnScores) {
++            if (params.scores_ptr != nullptr) {
++                scores_valid_k = std::min(seqlen_k, params.scores_max_len);
++                #pragma unroll
++                for (int n = 0; n < kScoresCols; ++n) {
++                    scores_cols[n] = get<1>(scores_coords(_0{}, n));
++                }
++                #pragma unroll
++                for (int m = 0; m < kScoresRows; ++m) {
++                    int const packed_row = m_block * kBlockM + get<0>(scores_coords(m, _0{}));
++                    int actual_row = packed_row;
++                    int actual_head = bidh;
++                    if constexpr (PackGQA) {
++                        int const qheads_per_kv = params.qhead_per_khead_divmod.divisor;
++                        actual_row = packed_row / qheads_per_kv;
++                        actual_head = bidh * qheads_per_kv + packed_row % qheads_per_kv;
++                    }
++                    if ((actual_row == 0 || actual_row == seqlen_q - 1) && actual_row < seqlen_q) {
++                        int64_t const offset = bidb * params.scores_batch_stride
++                            + actual_head * params.scores_head_stride
++                            + (actual_row == 0 ? 0 : params.scores_query_stride);
++                        scores_rows[m] = params.scores_ptr + offset;
++                        scores_any_row = true;
++                    }
++                }
++            }
++        }
++        auto write_scores_to_gmem = [&](auto& tSrS, int n_block) {
++            if constexpr (ReturnScores) {
++                if (!scores_any_row) { return; }
++                Tensor scores = make_tensor(tSrS.data(), flash::convert_layout_acc_rowcol(tSrS.layout()));
++                #pragma unroll
++                for (int m = 0; m < kScoresRows; ++m) {
++                    if (scores_rows[m] == nullptr) { continue; }
++                    #pragma unroll
++                    for (int n = 0; n < kScoresCols; ++n) {
++                        int const col = n_block * kBlockN + scores_cols[n];
++                        if (col < scores_valid_k) {
++                            scores_rows[m][col] = cutlass::bfloat16_t(scores(m, n));
++                        }
++                    }
++                }
++            }
++        };
++
+         auto write_P_to_smem = [&](auto& tOrP) {
+             if constexpr (LargeHeadDimV) {
+                 cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PEmpty) /*id*/);
+@@ -1281,6 +1355,7 @@ struct CollectiveMainloopFwdSm90 {
+             }
+             scoremod_premask_fn(tSrS);
+             mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block);
++            write_scores_to_gmem(tSrS, n_block);
+ 
+             Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/true, /*Check_inf=*/true>(tSrS);
+             // Don't need to store scales to send to WG1 (in the case of LargeHeadDimV) since it's 1.f
+@@ -1330,6 +1405,7 @@ struct CollectiveMainloopFwdSm90 {
+                 }
+                 scoremod_premask_fn(tSrS);
+                 mask_fn(tSrS, n_block);
++                write_scores_to_gmem(tSrS, n_block);
+                 cute::copy(softmax.template max_get_scale</*Is_first=*/false, Check_inf>(tSrS), scores_scale);
+                 if constexpr (LargeHeadDimV) { store_scales(scores_scale, smem_pipe_read_v.index()); }
+                 softmax.template online_softmax</*Is_first=*/false, Check_inf>(tSrS);
+@@ -1436,6 +1512,7 @@ struct CollectiveMainloopFwdSm90 {
+                 }
+                 scoremod_premask_fn(tSrS);
+                 mask_fn(tSrS, n_block);
++                write_scores_to_gmem(tSrS, n_block);
+                 Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
+                 if constexpr (LargeHeadDimV && !Is_first_iter) { store_scales(scores_scale, smem_pipe_read_prev.index()); }
+                 softmax.template online_softmax</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
+@@ -1776,7 +1853,8 @@ struct CollectiveMainloopFwdSm90 {
+             params.ptr_K, params.shape_K, params.stride_K,
+             params.ptr_V, params.headdim_v, params.stride_V,
+             params.page_size_divmod, params.blockN_per_page_size_divmod,
+-            bidb_kv, bidh_kv, thread_idx, seqlen_k_new, offset_k, bidb_kv_idx
++            bidb_kv, bidh_kv, thread_idx, seqlen_k_new, offset_k, bidb_kv_idx,
++            params.sparse_token_slots, params.sparse_token_slots_batch_stride
+             // passing offset_k instead of leftpad_k will move the PageTable pointer to the right position
+         );
+ 
+diff --git a/hopper/paged_kv.h b/hopper/paged_kv.h
+index 9ea59bc..643c98b 100644
+--- a/hopper/paged_kv.h
++++ b/hopper/paged_kv.h
+@@ -1,3 +1,4 @@
++// Modified for sparse_atten_spec: Vegas scores and sparse slots; see NOTICE.
+ /******************************************************************************
+  * Copyright (c) 2024, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
+  ******************************************************************************/
+@@ -83,6 +84,7 @@ struct PagedKVManager {
+     int const seqlen_k;
+     int const leftpad_k;
+     int const* const ptr_page_table;
++    int const* const ptr_token_slots;
+     GmemThrCopyKVCpAsync const gmem_thr_copy_kv;
+     TensorPageTable mPageTable;
+     TensorKV mK_paged, mV_paged;
+@@ -100,7 +102,9 @@ struct PagedKVManager {
+                    cutlass::FastDivmod const &page_size_divmod,
+                    cutlass::FastDivmod const &blockN_per_page_size_divmod,
+                    int const bidb, int const bidh, int const thread_idx, int const seqlen_k, int const leftpad_k,
+-                   int bidb_kv_idx
++                   int bidb_kv_idx,
++                   int const* ptr_token_slots_=nullptr,
++                   int64_t token_slots_batch_stride_=0
+                    )
+         : page_size_divmod(page_size_divmod)
+         , blockN_per_page_size_divmod(blockN_per_page_size_divmod)
+@@ -108,6 +112,7 @@ struct PagedKVManager {
+         , seqlen_k(seqlen_k)
+         , leftpad_k(leftpad_k)
+         , ptr_page_table(ptr_page_table_)
++        , ptr_token_slots(ptr_token_slots_ ? ptr_token_slots_ + bidb * token_slots_batch_stride_ : nullptr)
+         , gmem_thr_copy_kv(gmem_tiled_copy_kv.get_thread_slice(thread_idx))
+         , bidb_kv_idx(bidb_kv_idx)
+         , bidb_kv_idx_prev(bidb_kv_idx)
+@@ -145,7 +150,19 @@ struct PagedKVManager {
+             page_idx = page_size_divmod.divmod(page_offset, row_idx + leftpad_k);
+             // Add the condition (i + 1) * NumThreads <= kBlockN since that is an upper bound of row
+             // and is known at compile time. It avoids branching when e.g., kBlockN = 176 and i = 0.
+-            int const page = ((i + 1) * NumThreads <= kBlockN || row < kBlockN) && (!Seqlenk_mask || row_idx < seqlen_k) ? mPageTable[page_idx] : 0;
++            bool const valid_row = ((i + 1) * NumThreads <= kBlockN || row < kBlockN) && (!Seqlenk_mask || row_idx < seqlen_k);
++            int page = 0;
++            if (ptr_token_slots) {
++                // Mask before reading the slot table, including partial tiles.
++                if (valid_row && row_idx < seqlen_k) {
++                    int const slot = ptr_token_slots[row_idx];
++                    page = page_size_divmod.divmod(page_offset, slot);
++                } else {
++                    page_offset = 0;
++                }
++            } else {
++                page = valid_row ? mPageTable[page_idx] : 0;
++            }
+             tPrPageOffset[i] = {page, page_offset};
+             // if (cute::thread0()) { printf("row = %d, page_idx = %d, page_offset = %d, page = %d, leftpad_k = %d, seqlen_k = %d\n", row, page_idx, page_offset, page, leftpad_k, seqlen_k); }
+         }

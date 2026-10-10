@@ -1,0 +1,38 @@
+sparse_atten_spec
+
+This repository packages a StreamingLLM / Vegas self-speculative decoding
+port for a pinned vLLM version. It is not an official upstream release.
+The port and validation work used AI assistance.
+
+vLLM integration and sparse attention sources
+  Source: https://github.com/vllm-project/vllm
+  Base: 25ac790b81f18daa149197e2b46e37428e75bcf6
+  License: Apache-2.0
+  Copyright contributors to the vLLM project.
+
+Vegas and StreamingLLM reference implementation
+  Source: https://github.com/platformxlab/vegas
+  Reference: 7bf9d1edb8223307cff2089f855ca69cd094bc69
+  License: Apache-2.0
+  Original copyright and attribution notices are retained in source files.
+
+FlashAttention implementation
+  Base: https://github.com/vllm-project/flash-attention
+  Commit: 9cd61de38763d712bb6ce56e2a02cc2bf718c89f
+  Vegas reference: https://github.com/npz7yyk/vllm-flash-attn
+  Commit: 0c05c4b59b4a795f2c2add264fef094e758478e3
+  License: BSD-3-Clause, retained in licenses/FLASH_ATTENTION_LICENSE.
+  Copyright (c) 2022, the respective contributors, as shown by the AUTHORS file.
+  Original per-file copyright notices are retained.
+
+Port modifications
+  overlay/: sparse draft proposer, StreamingLLM window, Vegas per-layer
+  selection, variable-length reduction/top-k, and focused validation tools.
+  patches/vllm-integration.patch: config, runner, attention backend and
+  built-in FlashAttention wrapper integration.
+  flash-attention/hopper/ and patches/flash-attention.patch: optional Vegas
+  score arguments, first/last query score collection and sparse slot reads.
+  Modification notices identify the changed source files.
+
+Third-party licenses apply to their respective files. The root Apache-2.0
+license does not replace FlashAttention's BSD-3-Clause license.

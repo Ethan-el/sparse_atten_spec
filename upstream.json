@@ -1,0 +1,22 @@
+{
+  "vllm": {
+    "repository": "https://github.com/vllm-project/vllm.git",
+    "commit": "25ac790b81f18daa149197e2b46e37428e75bcf6",
+    "license": "Apache-2.0"
+  },
+  "vegas_reference": {
+    "repository": "https://github.com/platformxlab/vegas.git",
+    "commit": "7bf9d1edb8223307cff2089f855ca69cd094bc69",
+    "license": "Apache-2.0"
+  },
+  "flash_attention": {
+    "repository": "https://github.com/vllm-project/flash-attention.git",
+    "commit": "9cd61de38763d712bb6ce56e2a02cc2bf718c89f",
+    "license": "BSD-3-Clause"
+  },
+  "vegas_flash_attention_reference": {
+    "repository": "https://github.com/npz7yyk/vllm-flash-attn.git",
+    "commit": "0c05c4b59b4a795f2c2add264fef094e758478e3",
+    "license": "BSD-3-Clause"
+  }
+}

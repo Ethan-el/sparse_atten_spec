@@ -1,0 +1,620 @@
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index dbec9fd..31f0bfa 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -1,4 +1,5 @@
+ # SPDX-License-Identifier: Apache-2.0
++# Modified for sparse_atten_spec: StreamingLLM and Vegas integration; see NOTICE.
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ import copy
+@@ -78,6 +79,7 @@ SpeculativeMethod = Literal[
+     "draft_model",
+     "suffix",
+     "custom_class",
++    "sparse_attn",
+     EagleModelTypes,
+     NgramGPUTypes,
+     DSparkModelTypes,
+@@ -475,6 +477,18 @@ class SpeculativeConfig:
+     """Minimum size of ngram token window when using Ngram proposer, if
+     provided. Defaults to 1."""
+ 
++    # Self-speculative decoding with sparse attention
++    sparse_attn_algorithm: Literal["streamingllm", "vegas"] = "streamingllm"
++    """The KV sparsity pattern used by self-speculative decoding."""
++
++    sparse_attn_ratio: float = Field(default=0.05, gt=0, lt=1)
++    """The ratio of tokens to attend to in sparse attention. Only used when
++    sparse_attn_algorithm is specified. Defaults to 0.05."""
++
++    sparse_attn_min_tokens: int = Field(default=256, gt=0)
++    """The minimum number of tokens to attend to in sparse attention. Only used
++    when sparse_attn_algorithm is specified. Defaults to 256."""
++
+     # Alternative drafting strategies
+     parallel_drafting: bool = False
+     """Enable parallel drafting, where all speculative tokens are generated
+@@ -1170,6 +1184,8 @@ class SpeculativeConfig:
+                 self.model = "suffix"
+             elif self.method == "extract_hidden_states":
+                 self.model = "extract_hidden_states"
++            elif self.method == "sparse_attn":
++                self.model = "sparse_attn"
+             elif self.method == "custom_class":
+                 # method was set explicitly, but model should already contain the
+                 # custom module path. If not, this is a configuration error.
+@@ -1221,6 +1237,9 @@ class SpeculativeConfig:
+             self.draft_parallel_config = self.target_parallel_config
+         elif self.method == "suffix":
+             self._validate_suffix_decoding()
++        elif self.method == "sparse_attn":
++            # Self-speculative decoding; no separate draft model.
++            pass
+         elif self.method == "custom_class":
+             # Custom class proposer does not need a draft model.
+             # It will dynamically load the user-provided class at runtime.
+@@ -1978,6 +1997,9 @@ class SpeculativeConfig:
+         )
+         return min(num_mtp_layers, self.num_speculative_tokens) > 1
+ 
++    def use_sparse_attn(self) -> bool:
++        return self.method == "sparse_attn"
++
+     def __repr__(self) -> str:
+         method = self.method
+         model = (
+@@ -1988,6 +2010,7 @@ class SpeculativeConfig:
+                 "suffix",
+                 "extract_hidden_states",
+                 "custom_class",
++                "sparse_attn",
+             )
+             else self.draft_model_config.model
+         )
+diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
+index 6c8fb7e..a91d373 100644
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -1,4 +1,5 @@
+ # SPDX-License-Identifier: Apache-2.0
++# Modified for sparse_atten_spec: StreamingLLM and Vegas integration; see NOTICE.
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ import copy
+@@ -645,7 +646,11 @@ class VllmConfig:
+             # decoding instead of standard next-token sampling, so it has a query
+             # for the last sampled token plus queries for each draft token.
+             return self.num_speculative_tokens + 1
+-        if speculative_config.use_eagle() or speculative_config.uses_draft_model():
++        if (
++            speculative_config.use_eagle()
++            or speculative_config.uses_draft_model()
++            or speculative_config.use_sparse_attn()
++        ):
+             # DSpark (covered by use_eagle) drafts a block of num_speculative_tokens
+             # query tokens in which the anchor itself is the first prediction
+             # position (no separate bonus query), so it needs exactly
+@@ -3079,6 +3084,7 @@ class VllmConfig:
+                 "medusa",
+                 "mlp_speculator",
+                 "custom_class",
++                "sparse_attn",
+             ):
+                 unsupported.append(f"speculative method '{speculative_config.method}'")
+ 
+diff --git a/vllm/v1/attention/backends/flash_attn.py b/vllm/v1/attention/backends/flash_attn.py
+index 6035678..5e3b7eb 100755
+--- a/vllm/v1/attention/backends/flash_attn.py
++++ b/vllm/v1/attention/backends/flash_attn.py
+@@ -1,4 +1,5 @@
+ # SPDX-License-Identifier: Apache-2.0
++# Modified for sparse_atten_spec: StreamingLLM and Vegas integration; see NOTICE.
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Attention layer with FlashAttention."""
+ 
+@@ -88,6 +89,16 @@ from vllm.v1.worker.cp_utils import (
+ 
+ logger = init_logger(__name__)
+ 
++
++def _uses_vegas(vllm_config: VllmConfig | None) -> bool:
++    spec = vllm_config.speculative_config if vllm_config is not None else None
++    return (
++        spec is not None
++        and spec.use_sparse_attn()
++        and spec.sparse_attn_algorithm == "vegas"
++    )
++
++
+ FA4_DENSE_FLOAT_DTYPES = (torch.bfloat16, torch.float16)
+ FA4_DENSE_Q_TILE = 128
+ FA4_DENSE_NUM_BLOCKS = 256
+@@ -355,6 +366,8 @@ class FlashAttentionBackend(AttentionBackend):
+     def get_supported_kernel_block_sizes(
+         cls, kv_cache_spec: KVCacheSpec | None = None
+     ) -> list[int | MultipleOf]:
++        if _uses_vegas(get_current_vllm_config_or_none()):
++            return [MultipleOf(16)]
+         if block_size := cls._get_sm90_fa4_fp8_kv_block_size(kv_cache_spec):
+             return [block_size]
+         if block_size := cls._get_fa4_hd256_block_size(kv_cache_spec):
+@@ -366,6 +379,8 @@ class FlashAttentionBackend(AttentionBackend):
+ 
+     @classmethod
+     def get_preferred_block_size(cls, default_block_size: int) -> int:
++        if _uses_vegas(get_current_vllm_config_or_none()):
++            return super().get_preferred_block_size(default_block_size)
+         if block_size := cls._get_sm90_fa4_fp8_kv_block_size():
+             return max(default_block_size, block_size)
+         if block_size := cls._get_fa4_hd256_block_size():
+@@ -565,6 +580,9 @@ class FlashAttentionMetadata:
+     rswa_window: int | None = None
+     rswa_window_tensor: torch.Tensor | None = None
+ 
++    vegas_state: object | None = None
++    sparse_token_slots: torch.Tensor | None = None
++
+ 
+ def _get_sliding_window_configs(
+     vllm_config: VllmConfig,
+@@ -630,6 +648,8 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
+         vllm_config: "VllmConfig",
+         kv_cache_spec: "KVCacheSpec",
+     ) -> AttentionCGSupport:
++        if _uses_vegas(vllm_config):
++            return AttentionCGSupport.ALWAYS
+         return cls._cudagraph_support
+ 
+     def _get_scheduler_metadata(
+@@ -644,7 +664,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
+         causal: bool | torch.Tensor,
+         max_num_splits: int,
+     ) -> torch.Tensor | None:
+-        if not aot_schedule:
++        if not aot_schedule or self.uses_vegas:
+             return None
+ 
+         cache_dtype = self.cache_config.cache_dtype
+@@ -714,6 +734,11 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
+             kv_cache_block_size=self.block_size,
+             supports_fa4_hd256=True,
+         )
++        self.uses_vegas = _uses_vegas(vllm_config)
++        if self.uses_vegas:
++            fa_version = 3
++            self.aot_schedule = False
++            self.max_num_splits = 1
+         self.fa4_hd256 = fa_version == 4 and uses_fa4_hd256_kernel(
+             self.headdim, head_size_v
+         )
+@@ -1093,6 +1118,8 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
+         metadata.scheduler_metadata = self._store_scheduler_metadata(scheduler_metadata)
+ 
+     def use_cascade_attention(self, *args, **kwargs) -> bool:
++        if self.uses_vegas:
++            return False
+         if self.fa4_hd256:
+             # Cascade may use a non-page-aligned prefix length.
+             return False
+@@ -1153,6 +1180,31 @@ class FlashAttentionImpl(AttentionImpl):
+             requires_softcap=bool(self.logits_soft_cap),
+             supports_fa4_hd256=True,
+         )
++        if _uses_vegas(vllm_config):
++            from vllm.vllm_flash_attn.flash_attn_interface import vegas_fa3_supported
++
++            assert vllm_config is not None
++            supported, reason = vegas_fa3_supported()
++            if not supported:
++                raise NotImplementedError(reason)
++            if (
++                attn_type != AttentionType.DECODER
++                or alibi_slopes is not None
++                or sliding_window is not None
++                or self.logits_soft_cap != 0
++                or sinks is not None
++                or kv_sharing_target_layer_name is not None
++                or kv_cache_dtype not in ("auto", "bfloat16")
++                or head_size > 256
++                or vllm_config.model_config.dtype != torch.bfloat16
++                or vllm_config.parallel_config.world_size != 1
++                or vllm_config.parallel_config.decode_context_parallel_size != 1
++            ):
++                raise NotImplementedError(
++                    "Vegas requires BF16 global causal decoder attention on one "
++                    "GPU without ALiBi, softcap, sinks, sliding windows or KV sharing"
++                )
++            self.vllm_flash_attn_version = 3
+         self.fa4_hd256 = self.vllm_flash_attn_version == 4 and uses_fa4_hd256_kernel(
+             head_size
+         )
+@@ -1274,6 +1326,27 @@ class FlashAttentionImpl(AttentionImpl):
+ 
+         attn_type = self.attn_type
+ 
++        vegas_state: Any = attn_metadata.vegas_state
++        sparse_token_slots = attn_metadata.sparse_token_slots
++        uses_vegas = vegas_state is not None or sparse_token_slots is not None
++        if uses_vegas and (
++            self.vllm_flash_attn_version != 3
++            or attn_type != AttentionType.DECODER
++            or query.dtype != torch.bfloat16
++            or self.kv_cache_dtype not in ("auto", "bfloat16")
++            or self.dcp_world_size != 1
++            or attn_metadata.use_cascade
++            or attn_metadata.causal is not True
++            or self.alibi_slopes is not None
++            or self.sliding_window not in (None, (-1, -1))
++            or self.logits_soft_cap != 0
++            or self.sinks is not None
++            or attn_metadata.mm_prefix_query_range_tensor is not None
++            or attn_metadata.rswa_prefix_lens is not None
++            or (vegas_state is not None and sparse_token_slots is not None)
++        ):
++            raise NotImplementedError("Unsupported attention configuration for Vegas")
++
+         # IMPORTANT!
+         # NOTE(woosuk): With piece-wise CUDA graphs, this method is executed in
+         # eager-mode PyTorch. Thus, we need to be careful about any CPU overhead
+@@ -1318,6 +1391,40 @@ class FlashAttentionImpl(AttentionImpl):
+             )
+         key_cache, value_cache = fixed_k, fixed_v
+ 
++        if uses_vegas:
++            scores = (
++                vegas_state.scores_for(
++                    layer.layer_name, attn_metadata.seq_lens.shape[0]
++                )
++                if vegas_state is not None
++                else None
++            )
++            result = flash_attn_varlen_func(
++                q=query[:num_actual_tokens],
++                k=key_cache,
++                v=value_cache,
++                out=output[:num_actual_tokens],
++                cu_seqlens_q=attn_metadata.query_start_loc,
++                max_seqlen_q=attn_metadata.max_query_len,
++                seqused_k=attn_metadata.seq_lens,
++                max_seqlen_k=attn_metadata.max_seq_len,
++                block_table=attn_metadata.block_table,
++                softmax_scale=self.scale,
++                causal=True,
++                return_softmax_lse=scores is not None,
++                scheduler_metadata=None,
++                num_splits=1,
++                fa_version=3,
++                scores=scores,
++                sparse_token_slots=sparse_token_slots,
++            )
++            if vegas_state is not None:
++                _, lse = result
++                vegas_state.select(
++                    layer.layer_name, scores, lse, attn_metadata, self.scale
++                )
++            return output
++
+         if is_quantized_kv_cache(self.kv_cache_dtype):
+             # queries are quantized in the attention layer
+             key_cache = key_cache.view(current_platform.fp8_dtype())
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 1090466..ecc806b 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -1,4 +1,5 @@
+ # SPDX-License-Identifier: Apache-2.0
++# Modified for sparse_atten_spec: StreamingLLM and Vegas integration; see NOTICE.
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ import functools
+@@ -196,6 +197,7 @@ from vllm.v1.spec_decode.ngram_proposer_gpu import (
+     update_ngram_gpu_tensors_incremental,
+     update_scheduler_for_invalid_drafts,
+ )
++from vllm.v1.spec_decode.sparse_attn import SparseAttnProposer
+ from vllm.v1.spec_decode.step3p5 import Step3p5MTPProposer
+ from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
+ from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_change
+@@ -570,6 +572,12 @@ class GPUModelRunner(
+             logprobs_mode=self.model_config.logprobs_mode,
+             use_fp64_gumbel=self.model_config.use_fp64_gumbel,
+         )
++        if self.speculative_config and self.speculative_config.use_sparse_attn():
++            # Match q reconstruction; FlashInfer treats cutoff ties differently.
++            self.sampler.topk_topp_sampler.forward = (
++                self.sampler.topk_topp_sampler.forward_native
++            )
++            logger.info("sparse_attn uses native top-k/top-p sampling to match q.")
+ 
+         self.eplb_state: EplbState | None = None
+         self._moe_model: MixtureOfExperts | None = None
+@@ -613,6 +621,7 @@ class GPUModelRunner(
+                 | ExtractHiddenStatesProposer
+                 | Gemma4Proposer
+                 | Step3p5MTPProposer
++                | SparseAttnProposer
+             )
+             if self.speculative_config.method == "custom_class":
+                 self.drafter = create_custom_proposer(  # type: ignore[assignment]
+@@ -654,6 +663,8 @@ class GPUModelRunner(
+                 self.use_aux_hidden_state_outputs = True
+             elif self.speculative_config.method == "suffix":
+                 self.drafter = SuffixDecodingProposer(self.vllm_config)
++            elif self.speculative_config.use_sparse_attn():
++                self.drafter = SparseAttnProposer(self.vllm_config, self.device, self)
+             elif self.speculative_config.use_eagle():
+                 self.drafter = EagleProposer(self.vllm_config, self.device, self)
+                 if self.speculative_config.method == "eagle3":
+@@ -2303,6 +2314,16 @@ class GPUModelRunner(
+         assert num_reqs_padded is not None and num_tokens_padded is not None
+ 
+         attn_metadata: PerLayerAttnMetadata = {}
++        vegas = (
++            self.drafter.vegas
++            if isinstance(getattr(self, "drafter", None), SparseAttnProposer)
++            else None
++        )
++        if vegas is not None:
++            if ubatch_slices is not None:
++                raise ValueError("Vegas does not support microbatched attention.")
++            # Scores require the full target attention, not a cascade prefix.
++            cascade_attn_prefix_lens = None
+         if ubatch_slices is not None:
+             attn_metadata = [dict() for _ in range(len(ubatch_slices))]
+ 
+@@ -2353,6 +2374,8 @@ class GPUModelRunner(
+         # Zero out padded rows so stale data from condense() doesn't
+         # misclassify padding as prefill in CUDA graph mode.
+         is_prefilling[num_reqs:] = False
++        if vegas is not None:
++            vegas.prepare_target(is_prefilling, num_reqs)
+ 
+         # Compute mm_prefix bidirectional ranges before building
+         # attention metadata so builders handle them during build().
+@@ -2550,6 +2573,8 @@ class GPUModelRunner(
+ 
+             for layer_name in attn_group.layer_names:
+                 attn_metadata_dict[layer_name] = attn_metadata_i
++            if vegas is not None:
++                attn_metadata_i.vegas_state = vegas
+ 
+         # Prepare the attention metadata for each KV cache group and make layers
+         # in the same group share the same metadata.
+@@ -4614,21 +4639,24 @@ class GPUModelRunner(
+                 spec_config.use_eagle()
+                 or spec_config.uses_draft_model()
+                 or spec_config.uses_extract_hidden_states()
++                or spec_config.use_sparse_attn()
+             )
+             use_gpu_toks = (
+                 drafter_runs_model_forward
+                 and not spec_config.disable_padded_drafter_batch
+             )
+             if use_gpu_toks:
+-                # EAGLE/DraftModel speculative decoding can use the GPU sampled tokens
+-                # as inputs, and does not need to wait for bookkeeping to finish.
++                # EAGLE/DraftModel/SparseAttn speculative decoding can use the
++                # GPU sampled tokens as inputs, and does not need to wait for
++                # bookkeeping to finish.
+                 assert isinstance(
+                     self.drafter,
+                     EagleProposer
+                     | DFlashProposer
+                     | DraftModelProposer
+                     | ExtractHiddenStatesProposer
+-                    | Gemma4Proposer,
++                    | Gemma4Proposer
++                    | SparseAttnProposer,
+                 )
+                 sampled_token_ids = sampler_output.sampled_token_ids
+                 if input_fits_in_drafter:
+@@ -4928,9 +4956,23 @@ class GPUModelRunner(
+     def _get_spec_decode_draft_probs(
+         self, spec_decode_metadata: SpecDecodeMetadata
+     ) -> torch.Tensor | None:
++        if isinstance(getattr(self, "drafter", None), SparseAttnProposer):
++            return self.drafter.get_draft_probs(
++                spec_decode_metadata, self.input_batch.req_ids
++            )
+         if self._draft_probs is None or self._draft_prob_req_ids is None:
+             return None
+ 
++        counts = spec_decode_metadata.num_draft_tokens
++        if (
++            self._draft_prob_req_ids == self.input_batch.req_ids
++            and len(counts) == self._draft_probs.shape[0]
++            and len(counts) > 0
++            and all(count == self._draft_probs.shape[1] for count in counts)
++            and self._draft_probs.is_contiguous()
++        ):
++            return self._draft_probs.view(-1, self._draft_probs.shape[-1])
++
+         row_by_req_id = {
+             req_id: idx for idx, req_id in enumerate(self._draft_prob_req_ids)
+         }
+@@ -5097,6 +5139,47 @@ class GPUModelRunner(
+                 next_token_ids, valid_sampled_tokens_count
+             )
+ 
++        elif spec_config.use_sparse_attn():
++            assert isinstance(self.drafter, SparseAttnProposer)
++
++            assert not spec_config.disable_padded_drafter_batch
++            assert isinstance(sampled_token_ids, torch.Tensor), (
++                "sampled_token_ids should be a torch.Tensor for sparse_attn."
++            )
++            next_token_ids, valid_sampled_tokens_count = (
++                self.drafter.prepare_next_token_ids_padded(
++                    sampled_token_ids,
++                    self.requests,
++                    self.input_batch,
++                    self.discard_request_mask.gpu,
++                )
++            )
++            self._copy_valid_sampled_token_count(
++                next_token_ids, valid_sampled_tokens_count
++            )
++
++            num_rejected_tokens_gpu = None
++            if spec_decode_metadata is None:
++                token_indices_to_sample = None
++            else:
++                (
++                    common_attn_metadata,
++                    token_indices_to_sample,
++                    num_rejected_tokens_gpu,
++                ) = self.drafter.prepare_inputs_padded(
++                    common_attn_metadata,
++                    spec_decode_metadata,
++                    valid_sampled_tokens_count,
++                )
++
++            draft_token_ids = self.drafter.propose(
++                next_token_ids=next_token_ids,
++                token_indices_to_sample=token_indices_to_sample,
++                sampling_metadata=sampling_metadata,
++                common_attn_metadata=common_attn_metadata,
++                num_rejected_tokens_gpu=num_rejected_tokens_gpu,
++                slot_mappings=slot_mappings,
++            )
+         elif (
+             spec_config.use_eagle()
+             or spec_config.use_dflash()
+@@ -6173,6 +6256,15 @@ class GPUModelRunner(
+                     is_graph_capturing=is_graph_capturing,
+                     slot_mappings=slot_mappings,
+                 )
++            elif self.speculative_config and self.speculative_config.use_sparse_attn():
++                assert isinstance(self.drafter, SparseAttnProposer)
++                self.drafter.dummy_run(
++                    num_tokens,
++                    use_cudagraphs=not self.speculative_config.enforce_eager,
++                    is_graph_capturing=is_graph_capturing,
++                    attn_metadata=attn_metadata,
++                    slot_mappings=slot_mappings,
++                )
+ 
+         # We register layerwise NVTX hooks here after the first dynamo tracing is
+         # done to avoid nvtx operations in hook functions being traced by
+@@ -6825,6 +6917,10 @@ class GPUModelRunner(
+                 )
+                 torch.accelerator.synchronize()
+ 
++            if self.speculative_config and self.speculative_config.use_sparse_attn():
++                assert isinstance(self.drafter, SparseAttnProposer)
++                self.drafter.capture_model()
++
+             # Capture encoder CUDA graphs if enabled
+             if self.encoder_cudagraph_manager is not None:
+                 encoder_graph_pool = current_platform.graph_pool_handle()
+@@ -7391,6 +7487,11 @@ class GPUModelRunner(
+             # validate all draft model layers belong to the same kv cache
+             # group
+             self.drafter.validate_same_kv_cache_group(kv_cache_config)
++        elif self.speculative_config and self.speculative_config.use_sparse_attn():
++            assert isinstance(self.drafter, SparseAttnProposer)
++            # For SparseAttn self-speculation, validate all target model layers
++            # belong to the same kv cache group.
++            self.drafter.validate_same_kv_cache_group(kv_cache_config)
+ 
+         if has_kv_transfer_group() and not is_profiling:
+             kv_transfer_group = get_kv_transfer_group()
+diff --git a/vllm/vllm_flash_attn/flash_attn_interface.py b/vllm/vllm_flash_attn/flash_attn_interface.py
+index 3c4c0d8..0097ed8 100644
+--- a/vllm/vllm_flash_attn/flash_attn_interface.py
++++ b/vllm/vllm_flash_attn/flash_attn_interface.py
+@@ -1,4 +1,5 @@
+ # SPDX-License-Identifier: Apache-2.0
++# Modified for sparse_atten_spec: StreamingLLM and Vegas integration; see NOTICE.
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ # Copyright (c) 2023, Tri Dao.
+ # ruff: noqa: E501
+@@ -69,6 +70,20 @@ def _is_fa3_supported() -> tuple[bool, str | None]:
+     return True, None
+ 
+ 
++def vegas_fa3_supported() -> tuple[bool, str | None]:
++    supported, reason = _is_fa3_supported()
++    if not supported:
++        return supported, reason
++    try:
++        arguments = torch.ops._vllm_fa3_C.fwd.default._schema.arguments
++    except AttributeError:
++        return False, "Vegas requires the patched FA3 fwd operator"
++    names = {argument.name for argument in arguments}
++    if not {"scores", "sparse_token_slots"}.issubset(names):
++        return False, "Vegas requires FA3 with scores and sparse_token_slots support"
++    return True, None
++
++
+ def _is_fa4_supported() -> tuple[bool, str | None]:
+     if not FA4_AVAILABLE:
+         return False, f"FA4 is unavailable due to: {FA4_UNAVAILABLE_REASON}"
+@@ -214,6 +229,9 @@ def flash_attn_varlen_func(
+     aux_tensors=None,
+     aux_tensor_leading_dims=None,
+     dynamic_causal: "torch.Tensor | None" = None,
++    *,
++    scores: torch.Tensor | None = None,
++    sparse_token_slots: torch.Tensor | None = None,
+ ):
+     """dropout_p should be set to 0.0 during evaluation
+     Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
+@@ -289,6 +307,10 @@ def flash_attn_varlen_func(
+         aux_tensors: auxiliary tensors consumed by mask_mod. FA4 only.
+         aux_tensor_leading_dims: leading dimensions of each entry in aux_tensors.
+         dynamic_causal: optional per-sequence causal offsets. FA4 only.
++        scores: BF16 (batch, nheads, 2, capacity) raw first/last-query QK
++           scores written in-place by the Vegas FA3 extension.
++        sparse_token_slots: int32 (batch, capacity) physical token slots into
++           the original strided paged KV cache. Vegas FA3 only.
+ 
+     Return:
+         out: (total, nheads, headdim).
+@@ -321,6 +343,37 @@ def flash_attn_varlen_func(
+     else:
+         assert len(window_size) == 2
+         real_window_size = (window_size[0], window_size[1])
++    vegas_kwargs = {}
++    if scores is not None or sparse_token_slots is not None:
++        if fa_version != 3:
++            raise NotImplementedError("Vegas scores and token slots require FA3")
++        if scores is not None and sparse_token_slots is not None:
++            raise ValueError("Vegas score collection and sparse draft are separate")
++        if (
++            q.dtype != torch.bfloat16
++            or k.dtype != torch.bfloat16
++            or v.dtype != torch.bfloat16
++            or block_table is None
++            or q_v is not None
++            or alibi_slopes is not None
++            or softcap != 0
++            or s_aux is not None
++            or real_window_size != (-1, -1)
++            or causal is not True
++            or cp_world_size != 1
++            or cp_tot_seqused_k is not None
++            or dropout_p != 0
++            or scheduler_metadata is not None
++            or num_splits != 1
++        ):
++            raise NotImplementedError(
++                "Vegas requires unsplit BF16 global causal paged FA3 on one GPU"
++            )
++        # Ordinary FA3 calls keep their existing positional ABI with old .so files.
++        if scores is not None:
++            vegas_kwargs["scores"] = scores
++        if sparse_token_slots is not None:
++            vegas_kwargs["sparse_token_slots"] = sparse_token_slots
+     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+ 
+     dummy_cu_seqlens_k = torch.empty_like(cu_seqlens_q)
+@@ -414,6 +467,7 @@ def flash_attn_varlen_func(
+             cp_world_size,
+             cp_rank,
+             cp_tot_seqused_k,
++            **vegas_kwargs,
+         )
+     elif fa_version == 4:
+         assert alibi_slopes is None, "Alibi is not supported in FA4"
