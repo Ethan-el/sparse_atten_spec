@@ -3,7 +3,7 @@
 基于 vLLM 的稀疏注意力自推测解码移植，包含 StreamingLLM 和 Vegas。两者使用同一个模型生成草稿，以完整 KV 验证；稀疏化只作用于草稿 attention，不删除完整 KV。
 
 - `streamingllm`：草稿使用 sink 和 recent window。
-- `vegas`：验证阶段收集注意力重要性，下一轮草稿使用每层选出的历史 KV 和 recent tokens。
+- `vegas`：验证阶段收集注意力重要性，下一轮草稿使用每层选出的历史 KV 和 recent tokens。（带验证）
 
 这是固定版本的源码覆盖层和补丁，不是完整 vLLM，也不能在本仓库直接执行 `pip install -e .`。它是移植实现，不是作者原仓库的原样镜像。
 
